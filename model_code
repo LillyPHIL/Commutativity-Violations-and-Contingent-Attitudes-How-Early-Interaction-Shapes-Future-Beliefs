@@ -1,0 +1,607 @@
+
+
+import numpy as np
+import networkx as nx
+import pandas as pd
+
+
+from pgmpy.factors.discrete import TabularCPD
+from pgmpy.inference import VariableElimination
+from copy import deepcopy
+import pprint
+from itertools import product
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import os
+os.environ["PGMPY_DISABLE_PROGRESS"] = "1"
+
+from pgmpy.models import  DiscreteBayesianNetwork
+
+
+#This generates the dataframe of all possible combinations, then in order to use it to generate the network we need to select
+# each row of the dataframe and transform it into an array Ns = [tt,ft,rand].
+
+from itertools import permutations
+import pandas as pd
+
+class Ns_Combinations:
+    def __init__(self):
+
+        # only the unique base combinations (pink ones)
+        base = [
+            (0.1, 0.1, 0.8),
+            (0.1, 0.2, 0.7),
+            (0.2, 0.3, 0.5),
+            (0.3, 0.3, 0.4)
+        ]
+
+        rows = []
+
+        # add all unique permutations of each
+        for comb in base:
+            perms = set(permutations(comb))
+            rows.extend(perms)
+
+        self.dt = (
+            pd.DataFrame(rows, columns=["tt", "ft", "rand"])
+            .sort_values(["tt", "ft", "rand"])
+            .reset_index(drop=True)
+        )
+
+Comb = Ns_Combinations()
+
+
+print(f"lunghezza dataset: {len(Comb.dt)}")
+print(Comb.dt)
+
+
+
+scenario_1 = [
+    [0,    0.25, 0.25, 0,    0, 0],
+    [0,    0.25, 0.25, 0,    0, 0],
+    [0,    0.25, 0.25, 0,    0, 0],
+    [0,    0.25, 0.25, 0,    0, 0],
+    [0,    0,    0,    0,    1, 1],
+    [0.25, 0,    0,    0.25, 0, 0],
+    [0.25, 0,    0,    0.25, 0, 0],
+    [0.25, 0,    0,    0.25, 0, 0],
+    [0.25, 0,    0,    0.25, 0, 0]
+
+]
+
+
+scenario_1 = np.array(scenario_1)[:, [0, 2, 4, 1, 3, 5]]
+
+"""New class `BNetworkGenerator_NEW` for initializing the network given the corrections we discussed
+
+***INPUT PARAMETERS:***
+
+
+`num_Report (int)`: specify how many reports the model takes, needs to be combined with the sequence generation function;
+
+`H_prior (int)`: select the prior for H from the outset;
+
+`Ns_priors (array of three values)`: you need to extract one row of the dataframe that generates all the values for Ns and convert it to a 3 element array;
+
+`flag_truth_symmetric (True/False)`: IMPORTANT! it can be set as True only if `SpecifyRawValues` is False, precisely because otherwise you can't make sure that the bs values will be symmetric with respect to 0.5, so it only work with the automatic initialization to prevent the issue;
+
+
+`num_bs_states (int/None)`: specify how many types of ratios of 1s and 0s we are expecting the source to generate. If you select the number from the outset (which needs to be odd), the class automatically generates symmetric and equidistant numbers from 0.5 (included). If you set it to 11 you get all the 0, 0.1, ..., 0.9, 1;
+
+`SpecifyRawValues (True/False)`: If you specify True, you are requiring the class to ignore the automatic generation and to insert the bs values automatically, which need to be specified in the parameter below as an array;
+
+`custom_bs_probs (array)`: Specify the array of the personalized bs values;
+
+`flag_source_symmetric (True/False)`: If True, the internal values of the Bs probability table are source-symmetric. This condition goes with any kind of Bs probability table;
+
+`flag_strict_randomizer (True/False)`: if True, the agent believes that the only value acceptable for the randomizer is when Bs= 0.5. It can be made less strict by setting it to False, and it it assumed that also the two Bs values directly before and after 0.5 are also considered as possibilities. In the less strict case, the density for 0.5 is picked at random between 0.5 and 0.9 (it still has the greater density), whereas the remainder is split in two and assigned respectively to the other two values. I assumed that this case as well can be made sensitive to truth-symmetry.
+
+
+"""
+
+class BNetworkGenerator:
+    def __init__(self, num_Report, H_prior, Ns_priors, flag_truth_symmetric= True, num_bs_states=None, SpecifyRawValues=False, custom_bs_probs=None,
+                 flag_source_symmetric=False, flag_strict_randomizer= False, targeted_exploration= True, Bs_table= scenario_1):
+        self.num_Report = num_Report
+        self.H_prior = H_prior
+        self.source_symmetric = flag_source_symmetric
+        self.truth_symmetric = flag_truth_symmetric
+        self.strict_randomizer = flag_strict_randomizer
+        self.targeted_exploration = targeted_exploration
+
+
+        # ---TARGETED EXPLORATION ----
+        if self.targeted_exploration:
+
+            if Bs_table is None:
+                raise ValueError("Bs_table must be provided when targeted_exploration is True.")
+
+            Bs_table = np.array(Bs_table, dtype=float)
+
+            if Bs_table.ndim != 2 or Bs_table.shape[1] != 6:
+                raise ValueError(f"Bs_table must be a (k x 6) matrix, got shape {Bs_table.shape}.")
+
+            if not np.allclose(Bs_table.sum(axis=0), 1.0):
+                raise ValueError("Each column of Bs_table must sum to 1.")
+
+            if np.any(Bs_table < 0):
+                raise ValueError("Bs_table must not contain negative values.")
+
+            self.num_bs_states = Bs_table.shape[0]
+            self.values_Bs = Bs_table
+            self.k = self.num_bs_states
+
+            if num_bs_states is None:
+                self.bs_values = np.linspace(0, 1, self.num_bs_states)
+            else:
+                if num_bs_states != self.num_bs_states:
+                    raise ValueError(f"num_bs_states={num_bs_states} does not match Bs_table rows={self.num_bs_states}.")
+                self.bs_values = np.linspace(0, 1, self.num_bs_states)
+
+            bs_labels = [str(np.round(x, 3)) for x in self.bs_values]
+
+            self.state_names = {
+                'B_s': bs_labels,
+                'H': ['H', '$\\neg H$ '],
+                'N_s': ['tt', 'ft', 'ran']
+            }
+
+
+        # --- OG VERSION ----
+        else:
+            # 1. Determine the B_s values and state names
+            if SpecifyRawValues:
+                if custom_bs_probs is None:
+                    raise ValueError("custom_bs_probs must be provided when SpecifyRawValues is True.")
+
+                self.bs_values = np.array(custom_bs_probs, dtype=float)
+                self.num_bs_states = len(self.bs_values)
+
+                if self.num_bs_states % 2 == 0:
+                    raise ValueError("The length of custom_bs_probs must be an odd integer.")
+
+                bs_labels = [str(x) for x in self.bs_values]
+
+
+
+            else:
+                if num_bs_states is None:
+                    raise ValueError("num_bs_states must be provided if SpecifyRawValues is False.")
+
+                self.num_bs_states = num_bs_states
+
+                if not isinstance(self.num_bs_states, int) or self.num_bs_states % 2 == 0:
+                    raise ValueError("num_bs_states must be an odd integer.")
+
+                self.bs_values = np.linspace(0, 1, self.num_bs_states)
+                bs_labels = [str(np.round(x, 3)) for x in self.bs_values]
+
+
+            # States of the random variables
+            self.state_names = {
+                'B_s': bs_labels,
+                'H': ['H', '$\\neg H$ '],
+                'N_s': ['tt', 'ft', 'ran']
+            }
+
+            self.k = len(self.state_names['B_s'])
+            self.values_Bs = np.zeros((self.k, 6))
+
+            idx_gt_half = np.where(self.bs_values > 0.5)[0]
+            idx_lt_half = np.where(self.bs_values < 0.5)[0]
+            idx_eq_half = np.where(np.isclose(self.bs_values, 0.5))[0]
+
+            def get_random_probs(n):
+                if n == 0:
+                    return []
+                vals = np.random.uniform(0.05, 0.95, n)
+                return vals / vals.sum()
+
+            # Columns 1 and 5 (indices 0 and 4): Zeros for bs <= 0.5, random for bs > 0.5
+            if len(idx_gt_half) > 0:
+                self.values_Bs[idx_gt_half, 0] = get_random_probs(len(idx_gt_half))
+                self.values_Bs[idx_gt_half, 4] = get_random_probs(len(idx_gt_half))
+
+            # Columns 2 and 4 (indices 1 and 3): Zeros for bs >= 0.5, random for bs < 0.5
+            if len(idx_lt_half) > 0:
+                self.values_Bs[idx_lt_half, 1] = get_random_probs(len(idx_lt_half))
+                self.values_Bs[idx_lt_half, 3] = get_random_probs(len(idx_lt_half))
+
+            # Columns 3 and 6 (indices 2 and 5): Zeros everywhere except 1.0 where bs == 0.5
+            if self.strict_randomizer:
+                if len(idx_eq_half) > 0:
+                    self.values_Bs[idx_eq_half, 2] = 1.0
+                    self.values_Bs[idx_eq_half, 5] = 1.0
+                else:
+                    raise ValueError("No B_s value corresponds exactly to 0.5 for Columns 3 and 6.")
+
+            else:
+                if len(idx_eq_half) > 0:
+                    # Zero out columns 2 and 5 entirely before reassigning
+                    self.values_Bs[:, 2] = 0.0
+                    self.values_Bs[:, 5] = 0.0
+
+                    k_rand_1 = np.random.uniform(0.5, 0.9)
+                    k_rand_2 = np.random.uniform(0.5, 0.9)
+                    self.values_Bs[idx_eq_half, 2] = k_rand_1
+                    self.values_Bs[idx_eq_half, 5] = k_rand_2
+
+                    remainder_1 = (1 - k_rand_1) / 2
+                    remainder_2 = (1 - k_rand_2) / 2
+
+                    for idx in idx_eq_half:
+                        if idx - 1 >= 0:
+                            self.values_Bs[idx - 1, 2] = remainder_1
+                            self.values_Bs[idx - 1, 5] = remainder_2
+                        if idx + 1 < self.k:
+                            self.values_Bs[idx + 1, 2] = remainder_1
+                            self.values_Bs[idx + 1, 5] = remainder_2
+                else:
+                    raise ValueError("No B_s value corresponds exactly to 0.5 for Columns 3 and 6.")
+
+
+
+            if self.truth_symmetric and SpecifyRawValues == True:
+              raise ValueError("To be truth-symmetric Bs needs to have symmetric values below and above 0.5")
+
+
+            if  self.truth_symmetric and SpecifyRawValues == False:
+                self.values_Bs[:, 3] = self.values_Bs[::-1, 0]
+                # Column 3 is a copy of column 1
+                self.values_Bs[:, 4] = self.values_Bs[::-1, 1]
+                self.values_Bs[:, 5] = self.values_Bs[::-1, 2]
+
+            if self.source_symmetric:
+                # Column 5 is a copy of column 0
+                self.values_Bs[:, 4] = self.values_Bs[:, 0]
+                # Column 3 is a copy of column 1
+                self.values_Bs[:, 3] = self.values_Bs[:, 1]
+
+                if self.truth_symmetric:
+                    self.values_Bs[:,3] = self.values_Bs[::-1, 0]
+                    self.values_Bs[:,1] = self.values_Bs[::-1, 0]
+
+
+        p1, p2, p3= Ns_priors
+        self.values_Ns = [[p1], [p2], [p3]]
+        self.model = self._build_network()
+
+    def _build_network(self):
+        edges = [('H', 'B_s'), ('N_s', 'B_s')]
+        for i in range(self.num_Report):
+            edges.append(('B_s', f'R_{i}'))
+
+        model = DiscreteBayesianNetwork(edges)
+
+        # CPD
+        cpd_H = TabularCPD('H', 2, [[self.H_prior], [1- self.H_prior]])
+
+        cpd_B_s = TabularCPD(
+            variable='B_s',
+            variable_card=self.k,
+            values=self.values_Bs,
+            evidence=['H', 'N_s'],
+            evidence_card=[2, 3]
+        )
+
+        cpd_N_s = TabularCPD('N_s', 3, self.values_Ns)
+        
+        cpds_R = []
+        for i in range(self.num_Report):
+            cpd_R = TabularCPD(
+                variable=f'R_{i}',
+                variable_card=2,
+                values=[1 - self.bs_values, self.bs_values],
+                evidence=['B_s'],
+                evidence_card=[self.k]
+            )
+            cpds_R.append(cpd_R)
+
+        model.add_cpds(cpd_H, cpd_B_s, cpd_N_s, *cpds_R)
+
+        assert model.check_model(), "Flag Error in the Probability Table"
+
+        return model
+
+    def get_model(self):
+        return self.model
+
+
+
+#----------------INCREMENTAL GLOBAL UPDATE-------------------
+
+
+    def incremental_posteriors_given_reports(self, sequence):
+        if len(sequence) != self.num_Report:
+            raise ValueError("Length of sequence must match num_Report")
+
+        inference = VariableElimination(self.model)
+        results = []
+
+        for i, r_val in enumerate(sequence):
+            # Build evidence incrementally: R_0, then R_0+R_1, etc.
+            partial_evidence = {f'R_{j}': r_j for j, r_j in enumerate(sequence[:i+1])}
+
+            posterior_H  = inference.query(variables=['H'],   evidence=partial_evidence)
+            posterior_Ns = inference.query(variables=['N_s'], evidence=partial_evidence)
+            posterior_Bs = inference.query(variables=['B_s'], evidence=partial_evidence)
+
+            results.append({
+                "step":        i + 1,
+                "evidence":    partial_evidence,
+                "H":           posterior_H.values,
+                "N_s":         posterior_Ns.values,
+                "B_s":         posterior_Bs.values
+            })
+
+      
+
+        return results
+
+
+
+
+
+class SequentialUpdater:
+    def __init__(self, original_model, num_reports, num_bs_states, sequential_update_bs_too=False):
+        self.base_model = original_model
+        self.num_reports = num_reports
+        self.card_Bs = num_bs_states
+        self.update_bs = sequential_update_bs_too
+        self.states_H = [0, 1]
+        self.states_Ns = [0, 1, 2]
+
+
+
+    def run_sequential_update(self, sequence):
+        if len(sequence) != self.num_reports:
+            raise ValueError("Length of sequence must match the number of reports.")
+
+        working_model = deepcopy(self.base_model)
+        step_results = []
+
+        for i, r_val in enumerate(sequence):
+            current_evidence = {f'R_{i}': r_val}
+            inference = VariableElimination(working_model)
+
+            posterior_H = inference.query(variables=['H'], evidence=current_evidence)
+            posterior_Ns = inference.query(variables=['N_s'], evidence=current_evidence)
+
+            # Calculate the marginal posterior of B_s for the plot ---
+            posterior_Bs_marginal = inference.query(variables=['B_s'], evidence=current_evidence)
+            val_Bs_marginal = posterior_Bs_marginal.values
+
+            val_H = np.round(posterior_H.values, 5)
+            val_Ns = np.round(posterior_Ns.values, 5)
+
+            new_cpd_H = TabularCPD(variable='H', variable_card=2, values=val_H.reshape(2, 1))
+            new_cpd_Ns = TabularCPD(variable='N_s', variable_card=3, values=val_Ns.reshape(3, 1))
+
+            if self.update_bs: # if the flag is true, it also dynamically updates the Bs table
+                new_Bs_columns = []
+                for h in self.states_H:
+                    for ns in self.states_Ns:
+                        cond_evidence = current_evidence.copy()
+                        cond_evidence['H'] = h
+                        cond_evidence['N_s'] = ns
+
+                        posterior_Bs_cond = inference.query(variables=['B_s'], evidence=cond_evidence)
+                        new_Bs_columns.append(posterior_Bs_cond.values)
+
+                val_Bs_matrix = np.column_stack(new_Bs_columns)
+
+                new_cpd_Bs = TabularCPD(
+                    variable='B_s', variable_card=self.card_Bs,
+                    values=val_Bs_matrix, evidence=['H', 'N_s'], evidence_card=[2, 3]
+                )
+
+                working_model.remove_cpds('H', 'N_s', 'B_s')
+                working_model.add_cpds(new_cpd_H, new_cpd_Ns, new_cpd_Bs)
+                cpt_stored = val_Bs_matrix
+
+            else:
+                working_model.remove_cpds('H', 'N_s')
+                working_model.add_cpds(new_cpd_H, new_cpd_Ns)
+                cpt_stored = None
+
+            step_results.append({
+                "step": i + 1,
+                "evidence_applied": current_evidence,
+                "H_posterior": val_H,
+                "N_s_posterior": val_Ns,
+                "Bs_marginal_posterior": val_Bs_marginal, # Store for plotting
+                "Bs_updated": self.update_bs,
+                "Bs_new_cpt": cpt_stored
+            })
+
+        return step_results
+
+def generate_sequence(k, q):
+    """
+    Generate one Bernoulli evidence sequence of length k
+    with success probability q.
+    """
+    return np.random.binomial(1, q, k)
+
+
+
+
+    
+
+def worker_output_path(output_dir, ns_id, h_key, bn_rep):
+    safe_h = str(h_key).replace(".", "p")
+    return os.path.join(output_dir, f"worker_ns{ns_id}_h{safe_h}_bn{bn_rep}.csv")
+    
+    
+def run_worker(task):
+    ns_id, Ns_vec, h_key, bn_rep, rep_start, rep_end, T, q, fixed_bs_states, output_dir = task
+
+    seed = (
+        100000 * ns_id +
+        1000 * bn_rep +
+        int(h_key * 100) +
+        rep_start
+    )
+
+    np.random.seed(seed)
+
+    out_path = worker_output_path(output_dir, ns_id, h_key, f"{bn_rep}_rep{rep_start}_{rep_end}")
+    rows = []
+
+    bnet = BNetworkGenerator(
+        num_Report=T,
+        H_prior=h_key,
+        Ns_priors=Ns_vec,
+        num_bs_states=fixed_bs_states,
+        targeted_exploration=True,
+        Bs_table=scenario_1
+    )
+
+    model = bnet.get_model()
+
+    for seq_rep in range(rep_start, rep_end):
+        sequence = generate_sequence(T, q)
+
+        seq_used = sequence
+        T_current = len(seq_used)
+
+        global_res = bnet.incremental_posteriors_given_reports(seq_used)
+        global_final = global_res[-1]["H"][0]
+
+        seq_updater_static = SequentialUpdater(
+            model,
+            num_reports=T_current,
+            num_bs_states=bnet.k,
+            sequential_update_bs_too=False
+        )
+        static_res = seq_updater_static.run_sequential_update(seq_used)
+        static_final = static_res[-1]["H_posterior"][0]
+
+        seq_updater_dynamic = SequentialUpdater(
+            model,
+            num_reports=T_current,
+            num_bs_states=bnet.k,
+            sequential_update_bs_too=True
+        )
+        dynamic_res = seq_updater_dynamic.run_sequential_update(seq_used)
+        dynamic_final = dynamic_res[-1]["H_posterior"][0]
+        
+        global_final_Ns = global_res[-1]["N_s"]
+        static_final_Ns = static_res[-1]["N_s_posterior"]
+        dynamic_final_Ns = dynamic_res[-1]["N_s_posterior"]
+        
+        global_final_Bs = global_res[-1]["B_s"]
+        static_final_Bs = static_res[-1]["Bs_marginal_posterior"]
+        dynamic_final_Bs = dynamic_res[-1]["Bs_marginal_posterior"]
+
+
+
+        row = {
+            "ns_id": ns_id,
+            "H_prior": h_key,
+            "bn_rep": bn_rep,
+            "seq_rep": seq_rep,
+            "base_sequence": sequence.tolist(),
+            "tt": Ns_vec[0],
+            "ft": Ns_vec[1],
+            "rand": Ns_vec[2],
+            "q": q,
+            "T": T_current,
+            "final_global": global_final,
+            "final_local_static": static_final,
+            "final_local_dynamic": dynamic_final,
+            
+            "final_global_Ns_tt": global_final_Ns[0],
+            "final_global_Ns_ft": global_final_Ns[1],
+            "final_global_Ns_rand": global_final_Ns[2],
+    
+            "final_local_static_Ns_tt": static_final_Ns[0],
+            "final_local_static_Ns_ft": static_final_Ns[1],
+            "final_local_static_Ns_rand": static_final_Ns[2],
+    
+            "final_local_dynamic_Ns_tt": dynamic_final_Ns[0],
+            "final_local_dynamic_Ns_ft": dynamic_final_Ns[1],
+            "final_local_dynamic_Ns_rand": dynamic_final_Ns[2],
+            
+            "global_final_Bs": global_final_Bs.tolist(),
+            "static_final_Bs": static_final_Bs.tolist(),
+            "dynamic_final_Bs": dynamic_final_Bs.tolist(),
+        }
+        rows.append(row)
+
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    return out_path
+ 
+
+if __name__ == "__main__":
+
+
+    max_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+    H_priors_grid = [0.1, 0.3, 0.5, 0.7, 0.9]
+    T = 1
+    q = 0.7
+    FIXED_BS_STATES = 9
+    n_rep = 10
+    n_rep_bn = 1
+    chunk_size = 5
+
+    output_dir = "test"
+    os.makedirs(output_dir, exist_ok=True)
+
+    tasks = []
+    
+    for ns_pos, (_, row) in enumerate(Comb.dt.iterrows(), start=1):
+    
+        #if ns_pos > 11:
+         #   continue
+            
+        Ns_vec = [row.tt, row.ft, row.rand]
+    
+        for h in H_priors_grid:
+            h_key = round(float(h), 3)
+    
+            for bn_rep in range(n_rep_bn):
+    
+                for rep_start in range(0, n_rep, chunk_size):
+                    rep_end = min(rep_start + chunk_size, n_rep)
+    
+                    tasks.append((
+                        ns_pos - 1,
+                        Ns_vec,
+                        h_key,
+                        bn_rep,
+                        rep_start,
+                        rep_end,
+                        T,
+                        q,
+                        FIXED_BS_STATES,
+                        output_dir
+                    ))
+                    
+    total_tasks = len(tasks)
+    done_tasks = 0
+    worker_files = []
+
+    print(f"Starting simulation with {total_tasks} tasks using {max_workers} workers")
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(run_worker, task) for task in tasks]
+    
+        for fut in as_completed(futures):
+            try:
+                result_file = fut.result()
+                worker_files.append(result_file)
+            except Exception as e:
+                print(f"Worker failed: {e}")
+            finally:
+                done_tasks += 1
+                if done_tasks % 10 == 0 or done_tasks == total_tasks:
+                    print(f"[{done_tasks}/{total_tasks}] {100 * done_tasks / total_tasks:.2f}% complete")
+                    
+    
+    if not worker_files:
+        raise RuntimeError("No worker output files were created. All workers failed or no tasks ran.")
+    
+    df_final = pd.concat((pd.read_csv(f) for f in worker_files), ignore_index=True)
+
