@@ -1,1 +1,2 @@
 combined_workers_q_0.7_s5.csv filter=lfs diff=lfs merge=lfs -text
+combined_workers_q_0.7_s*.csv filter=lfs diff=lfs merge=lfs -text
